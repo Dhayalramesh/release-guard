@@ -1,0 +1,70 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: pytest -v
+
+  docker-smoke:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t release-guard:${{ github.sha }} .
+      - name: Healthy release passes
+        run: |
+          docker run -d --name svc -p 8000:8000 -e APP_VERSION=v1.0.0 release-guard:${{ github.sha }}
+          bash scripts/healthcheck.sh http://localhost:8000/health 10 2 || { docker logs svc; exit 1; }
+      - name: Broken release must be detected
+        run: |
+          docker rm -f svc
+          docker run -d --name bad -p 8000:8000 -e APP_VERSION=v1.1.0 -e APP_BROKEN=1 release-guard:${{ github.sha }}
+          if bash scripts/healthcheck.sh http://localhost:8000/health 3 2; then
+            echo "broken release was NOT detected"; exit 1
+          fi
+          echo "broken release correctly rejected"
+
+  release-demo:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+
+      - name: Good release to staging, then promote to production
+        run: |
+          python releaseguard.py deploy --env staging --version v1.0.0 --risk low --approver "CI Bot" --rollback-plan "redeploy previous tag"
+          python releaseguard.py deploy --env production --version v1.0.0 --risk low --approver "CI Bot" --rollback-plan "redeploy previous tag"
+
+      - name: Production is blocked for an unstaged version
+        run: |
+          code=0
+          python releaseguard.py deploy --env production --version v9.9.9 --risk low --approver "CI Bot" --rollback-plan "redeploy previous tag" || code=$?
+          test "$code" -eq 1
+
+      - name: Broken release must roll back automatically
+        run: |
+          code=0
+          python releaseguard.py deploy --env staging --version v1.1.0 --risk medium --approver "CI Bot" --rollback-plan "redeploy previous tag" --simulate-broken || code=$?
+          test "$code" -eq 1
+          python releaseguard.py status --env staging | grep "'recorded_live': 'v1.0.0'"
+
+      - name: Deploy history (proof of the run)
+        if: always()
+        run: python releaseguard.py history
+
+      - name: Stop services
+        if: always()
+        run: python releaseguard.py stop
